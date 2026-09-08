@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from updater import GitHubUpdater, UpdateError
 
 APP_NAME = "AutoSave Notepad"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.1.0"
 GITHUB_OWNER = "BignerCZE"
 GITHUB_REPO = "SimpleNotePad"
 
@@ -1086,6 +1086,65 @@ class AutoSaveNotepadApp:
             return
         self.offer_update(release)
 
+    def create_update_progress_dialog(self, target_version):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Aktualizace AutoSave Notepad")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        frame = ttk.Frame(dialog, padding=18)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=f"Aktualizace na verzi {target_version}",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 12))
+
+        phase_var = tk.StringVar(value="Připravuji aktualizaci…")
+        ttk.Label(
+            frame,
+            textvariable=phase_var,
+            width=58,
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        progress_var = tk.DoubleVar(value=0)
+        progress = ttk.Progressbar(
+            frame,
+            variable=progress_var,
+            maximum=100,
+            mode="determinate",
+            length=480,
+        )
+        progress.pack(fill="x", pady=(0, 6))
+
+        percent_var = tk.StringVar(value="0 %")
+        ttk.Label(
+            frame,
+            textvariable=percent_var,
+            anchor="e",
+        ).pack(fill="x")
+
+        dialog.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - dialog.winfo_reqwidth()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - dialog.winfo_reqheight()) // 2)
+        dialog.geometry(f"+{x}+{y}")
+        dialog.grab_set()
+
+        def set_phase(text):
+            phase_var.set(text)
+            dialog.update_idletasks()
+
+        def set_progress(value):
+            value = max(0.0, min(100.0, float(value)))
+            progress_var.set(value)
+            percent_var.set(f"{int(round(value))} %")
+            dialog.update_idletasks()
+
+        return dialog, set_phase, set_progress
+
     def offer_update(self, release):
         if not messagebox.askyesno(
             "Je dostupná aktualizace",
@@ -1095,17 +1154,56 @@ class AutoSaveNotepadApp:
             parent=self.root
         ):
             return
+
         if not getattr(sys, "frozen", False):
-            messagebox.showinfo("Aktualizace", "Automatická instalace funguje v EXE verzi.", parent=self.root)
+            messagebox.showinfo(
+                "Aktualizace",
+                "Automatická instalace funguje v EXE verzi.",
+                parent=self.root
+            )
             return
+
+        dialog, set_phase, set_progress = self.create_update_progress_dialog(
+            release["version"]
+        )
+
         try:
             self.save_state()
-            new_exe = self.updater.download_and_verify(release)
+
+            set_phase("Připravuji stahování…")
+            set_progress(5)
+
+            new_exe = self.updater.download_and_verify(
+                release,
+                progress_callback=set_progress,
+                phase_callback=set_phase,
+            )
+
+            set_phase("Připravuji bezpečnou výměnu programu…")
+            set_progress(97)
             self.updater.install_after_exit(new_exe)
+
+            set_phase("Instalátor je připraven. Ukončuji starou verzi…")
+            set_progress(100)
+            dialog.update_idletasks()
+
+            # Give the user a brief chance to see the final phase.
+            self.root.after(700, self.root.destroy)
+
         except UpdateError as e:
-            messagebox.showerror("Aktualizace", str(e), parent=self.root)
-            return
-        self.root.destroy()
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+            log_path = self.updater.get_update_log_path()
+            messagebox.showerror(
+                "Aktualizace",
+                f"{e}\n\n"
+                f"Diagnostický log aktualizace:\n{log_path}",
+                parent=self.root
+            )
 
     def show_about(self):
         messagebox.showinfo("O programu", f"{APP_NAME}\nVerze {APP_VERSION}\n\n{GITHUB_OWNER}/{GITHUB_REPO}")
