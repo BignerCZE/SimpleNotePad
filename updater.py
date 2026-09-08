@@ -153,16 +153,16 @@ class GitHubUpdater:
             'copy /Y "%NEW%" "%OLD%" >NUL\n'
             "if errorlevel 1 exit /b 1\n"
             'set "PYINSTALLER_RESET_ENVIRONMENT=1"\n'
+            'set "_PYI_ARCHIVE_FILE="\n'
+            'set "_PYI_APPLICATION_HOME_DIR="\n'
+            'set "_PYI_PARENT_PROCESS_LEVEL="\n'
+            'set "_PYI_SPLASH_IPC="\n'
             'start "" "%OLD%"\n'
             'del "%NEW%" >NUL 2>&1\n'
             'del "%~f0" >NUL 2>&1\n'
         )
         try:
             script.write_text(cmd, encoding="utf-8")
-
-            # Start the helper with a clean PyInstaller environment. Without
-            # this, a one-file executable can inherit the old bootloader state
-            # and reject the restarted EXE as an invalid child process.
             env = os.environ.copy()
             env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
 
