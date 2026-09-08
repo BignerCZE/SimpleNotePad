@@ -10,8 +10,8 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from updater import GitHubUpdater, UpdateError
 
-APP_NAME = "AutoSave Notepad"
-APP_VERSION = "2.0.0"
+APP_NAME = "AutoSave Notepad - test aktualizace"
+APP_VERSION = "2.0.1"
 GITHUB_OWNER = "BignerCZE"
 GITHUB_REPO = "SimpleNotePad"
 
