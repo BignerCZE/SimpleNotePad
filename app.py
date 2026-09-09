@@ -3,15 +3,22 @@ import os
 import re
 import sys
 import tempfile
+import uuid
+from io import BytesIO
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from PIL import Image, ImageGrab, ImageTk
+from docx import Document
+from docx.oxml.ns import qn
+from docx.shared import Inches, Pt
+
 from updater import GitHubUpdater, UpdateError
 
 APP_NAME = "AutoSave Notepad"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.4.0"
 GITHUB_OWNER = "BignerCZE"
 GITHUB_REPO = "SimpleNotePad"
 
@@ -35,7 +42,16 @@ FORMAT_ACTIVE_BORDER = "#7aa7d9"
 
 
 class NoteTab:
-    def __init__(self, app, title, content="", file_path=None, custom_title=None, formatting=None):
+    def __init__(
+        self,
+        app,
+        title,
+        content="",
+        file_path=None,
+        custom_title=None,
+        formatting=None,
+        images=None,
+    ):
         self.app = app
         self.file_path = file_path
         self.custom_title = custom_title
@@ -66,6 +82,12 @@ class NoteTab:
         self.text.insert("1.0", content)
 
         self._format_tags = {}
+        self.embedded_images = {}
+        self.selected_image_name = None
+        self.image_resize_handles = {}
+        self._image_resize_drag = None
+        self._image_handle_refresh_job = None
+        self._loading_document = False
         self.typing_style = {
             "bold": False,
             "italic": False,
@@ -82,7 +104,12 @@ class NoteTab:
         self.text.bind("<Control-u>", lambda e: self._shortcut("underline"))
         self.text.bind("<KeyPress>", self.on_keypress, add="+")
         self.text.bind("<<Paste>>", self.on_paste, add="+")
-        self.text.bind("<ButtonRelease-1>", self.on_caret_moved, add="+")
+        self.text.bind("<ButtonRelease-1>", self.on_editor_click, add="+")
+        self.text.bind("<Configure>", self.schedule_image_handle_refresh, add="+")
+        self.text.bind("<MouseWheel>", self.schedule_image_handle_refresh, add="+")
+        self.text.bind("<Button-4>", self.schedule_image_handle_refresh, add="+")
+        self.text.bind("<Button-5>", self.schedule_image_handle_refresh, add="+")
+        self.text.bind("<KeyRelease>", self.schedule_image_handle_refresh, add="+")
         for sequence in (
             "<KeyRelease-Left>", "<KeyRelease-Right>",
             "<KeyRelease-Up>", "<KeyRelease-Down>",
@@ -128,6 +155,11 @@ class NoteTab:
         return None
 
     def on_paste(self, event=None):
+        # Prefer an image if the Windows clipboard contains one; otherwise
+        # allow Tk's normal text paste and apply the active typing style.
+        if self.paste_image_from_clipboard():
+            return "break"
+
         try:
             self._pending_insert_start = (
                 self.text.index("sel.first")
@@ -137,6 +169,473 @@ class NoteTab:
         except tk.TclError:
             self._pending_insert_start = self.text.index("insert")
         self.text.after_idle(self.apply_typing_style_to_recent_insert)
+        return None
+
+    def paste_image_from_clipboard(self):
+        try:
+            clipboard = ImageGrab.grabclipboard()
+        except Exception:
+            return False
+
+        image = None
+
+        if isinstance(clipboard, Image.Image):
+            image = clipboard.copy()
+        elif isinstance(clipboard, list):
+            # Windows may expose a copied image file as a list of paths.
+            for item in clipboard:
+                try:
+                    path = Path(item)
+                    if path.is_file():
+                        with Image.open(path) as opened:
+                            image = opened.convert("RGBA").copy()
+                        break
+                except Exception:
+                    continue
+
+        if image is None:
+            return False
+
+        self.insert_pil_image(image)
+        return True
+
+    def insert_pil_image(self, image, mark_modified=True):
+        try:
+            start = self.text.index("sel.first")
+            end = self.text.index("sel.last")
+            self.text.delete(start, end)
+            index = start
+        except tk.TclError:
+            index = self.text.index("insert")
+
+        try:
+            rgba = image.convert("RGBA")
+            buffer = BytesIO()
+            rgba.save(buffer, format="PNG")
+            image_bytes = buffer.getvalue()
+        except Exception as e:
+            messagebox.showerror(
+                "Vložení obrázku",
+                f"Obrázek se nepodařilo zpracovat:\n{e}",
+                parent=self.app.root,
+            )
+            return
+
+        display_width = self._default_image_display_width(rgba.width)
+        photo = self._make_display_photo(rgba, display_width)
+        tk_name = f"img_{uuid.uuid4().hex}"
+
+        try:
+            self.text.image_create(
+                index,
+                image=photo,
+                name=tk_name,
+                padx=4,
+                pady=4,
+            )
+        except tk.TclError as e:
+            messagebox.showerror(
+                "Vložení obrázku",
+                f"Obrázek se nepodařilo vložit:\n{e}",
+                parent=self.app.root,
+            )
+            return
+
+        self.embedded_images[tk_name] = {
+            "photo": photo,
+            "bytes": image_bytes,
+            "pixel_size": rgba.size,
+            "display_width_px": display_width,
+        }
+        self.select_image(tk_name)
+
+        try:
+            self.text.mark_set("insert", f"{tk_name} +1c")
+        except tk.TclError:
+            pass
+
+        if mark_modified:
+            self.saved = False
+            self.app.update_tab_title(self)
+            # Image insertion is infrequent, so write a recovery DOCX immediately.
+            self.write_temp_snapshot()
+            self.app.save_state()
+            self.app.set_status("Obrázek vložen ze schránky")
+
+    def insert_image_bytes(
+        self,
+        image_bytes,
+        mark_modified=False,
+        display_width_px=None,
+    ):
+        try:
+            with Image.open(BytesIO(image_bytes)) as opened:
+                image = opened.convert("RGBA").copy()
+        except Exception:
+            return False
+
+        try:
+            index = self.text.index("insert")
+            rgba = image.convert("RGBA")
+            buffer = BytesIO()
+            rgba.save(buffer, format="PNG")
+            normalized_bytes = buffer.getvalue()
+
+            if display_width_px is None:
+                display_width_px = self._default_image_display_width(rgba.width)
+
+            photo = self._make_display_photo(rgba, display_width_px)
+            tk_name = "img_" + uuid.uuid4().hex
+        except Exception:
+            return False
+
+        # Correct name string construction separately for clarity.
+        tk_name = "img_" + uuid.uuid4().hex
+
+        try:
+            self.text.image_create(
+                index,
+                image=photo,
+                name=tk_name,
+                padx=4,
+                pady=4,
+            )
+        except tk.TclError:
+            return False
+
+        self.embedded_images[tk_name] = {
+            "photo": photo,
+            "bytes": normalized_bytes,
+            "pixel_size": rgba.size,
+            "display_width_px": int(display_width_px),
+        }
+
+        try:
+            self.text.mark_set("insert", f"{tk_name} +1c")
+        except tk.TclError:
+            pass
+
+        if mark_modified:
+            self.select_image(tk_name)
+            self.saved = False
+            self.app.update_tab_title(self)
+            self.app.save_state()
+
+        return True
+
+    def _editor_available_image_width(self):
+        try:
+            width = int(self.text.winfo_width())
+        except (tk.TclError, ValueError):
+            width = 0
+
+        if width <= 1:
+            # Reasonable fallback before the widget has been laid out.
+            width = 900
+
+        # Keep a small visual margin inside the editor.
+        return max(80, width - 44)
+
+    def _default_image_display_width(self, original_width):
+        available = self._editor_available_image_width()
+        return max(1, min(int(original_width), int(available)))
+
+    def _make_display_photo(self, image, display_width_px=None):
+        display = image.copy()
+
+        if display_width_px is None:
+            display_width_px = self._default_image_display_width(display.width)
+
+        display_width_px = max(1, int(display_width_px))
+
+        if display.width != display_width_px:
+            ratio = display_width_px / display.width
+            new_size = (
+                display_width_px,
+                max(1, int(round(display.height * ratio))),
+            )
+            display = display.resize(new_size, Image.Resampling.LANCZOS)
+
+        return ImageTk.PhotoImage(display)
+
+    def resize_selected_image(
+        self,
+        width_px,
+        save_state=True,
+        refresh_handles=True,
+    ):
+        meta = self.get_selected_image_meta()
+        if not meta:
+            return False
+
+        try:
+            original_width, original_height = meta["pixel_size"]
+            width_px = int(round(float(width_px)))
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        # Allow deliberate enlargement above the window width, but keep a
+        # sane technical range.
+        width_px = max(40, min(6000, width_px))
+
+        try:
+            with Image.open(BytesIO(meta["bytes"])) as opened:
+                image = opened.convert("RGBA").copy()
+        except Exception:
+            return False
+
+        photo = self._make_display_photo(image, width_px)
+
+        try:
+            self.text.image_configure(self.selected_image_name, image=photo)
+        except tk.TclError:
+            return False
+
+        meta["photo"] = photo
+        meta["display_width_px"] = width_px
+        self.saved = False
+        self.app.update_tab_title(self)
+
+        if refresh_handles:
+            self.schedule_image_handle_refresh()
+
+        self.app.sync_image_menu_state()
+
+        if save_state:
+            self.app.save_state()
+
+        return True
+
+    def reset_selected_image_size(self):
+        meta = self.get_selected_image_meta()
+        if not meta:
+            return False
+        try:
+            original_width = int(meta["pixel_size"][0])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return self.resize_selected_image(original_width)
+
+    def fit_selected_image_to_window(self):
+        if not self.get_selected_image_meta():
+            return False
+        return self.resize_selected_image(self._editor_available_image_width())
+
+    def scale_selected_image(self, factor):
+        meta = self.get_selected_image_meta()
+        if not meta:
+            return False
+        try:
+            current = int(meta.get("display_width_px") or meta["pixel_size"][0])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return self.resize_selected_image(current * float(factor))
+
+    def _cleanup_stale_images(self):
+        live_names = set(self.text.image_names())
+        for name in list(self.embedded_images):
+            if name not in live_names:
+                self.embedded_images.pop(name, None)
+
+    def _set_run_format(self, run, style):
+        run.bold = bool(style.get("bold"))
+        run.italic = bool(style.get("italic"))
+        run.underline = bool(style.get("underline"))
+        run.font.name = "Segoe UI"
+        run.font.size = Pt(int(style.get("size") or DEFAULT_FONT_SIZE))
+
+    def _append_text_to_docx(self, document, paragraph, value, style):
+        if paragraph is None:
+            paragraph = document.add_paragraph()
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+
+        parts = value.split("\n")
+        for idx, part in enumerate(parts):
+            if part:
+                run = paragraph.add_run(part)
+                self._set_run_format(run, style)
+
+            if idx < len(parts) - 1:
+                paragraph = document.add_paragraph()
+                paragraph.paragraph_format.space_before = Pt(0)
+                paragraph.paragraph_format.space_after = Pt(0)
+
+        return paragraph
+
+    def _append_image_to_docx(self, document, paragraph, image_name):
+        meta = self.embedded_images.get(image_name)
+        if not meta or not meta.get("bytes"):
+            return paragraph
+
+        if paragraph is None:
+            paragraph = document.add_paragraph()
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+
+        image_bytes = meta["bytes"]
+
+        try:
+            original_width, original_height = meta.get("pixel_size") or (0, 0)
+            if not original_width:
+                with Image.open(BytesIO(image_bytes)) as img:
+                    original_width, original_height = img.size
+
+            display_width_px = int(
+                meta.get("display_width_px") or original_width
+            )
+
+            # Store the actual size chosen in the editor. 96 DPI gives a
+            # predictable mapping between screen pixels and Word inches.
+            width_inches = max(0.2, display_width_px / 96.0)
+            run = paragraph.add_run()
+            run.add_picture(BytesIO(image_bytes), width=Inches(width_inches))
+        except Exception as e:
+            raise OSError(f"Obrázek se nepodařilo zapsat do DOCX: {e}") from e
+
+        return paragraph
+
+    def save_docx(self, path):
+        self._cleanup_stale_images()
+
+        document = Document()
+        normal = document.styles["Normal"]
+        normal.font.name = "Segoe UI"
+        normal.font.size = Pt(DEFAULT_FONT_SIZE)
+
+        try:
+            document.core_properties.title = self.get_title()
+        except Exception:
+            pass
+
+        paragraph = None
+        dump = self.text.dump(
+            "1.0",
+            "end-1c",
+            text=True,
+            tag=True,
+            image=True,
+        )
+
+        for kind, value, index in dump:
+            if kind == "text":
+                style = self.style_at(index)
+                paragraph = self._append_text_to_docx(
+                    document, paragraph, value, style
+                )
+            elif kind == "image":
+                paragraph = self._append_image_to_docx(
+                    document, paragraph, value
+                )
+
+        if paragraph is None:
+            paragraph = document.add_paragraph()
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.space_after = Pt(0)
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        document.save(path)
+
+    def _style_from_docx_run(self, run):
+        size = DEFAULT_FONT_SIZE
+        if run.font.size is not None:
+            try:
+                size = int(round(run.font.size.pt))
+            except Exception:
+                pass
+
+        return {
+            "bold": bool(run.bold),
+            "italic": bool(run.italic),
+            "underline": bool(run.underline),
+            "size": max(6, min(96, size)),
+        }
+
+    def _insert_loaded_text(self, value, style):
+        if not value:
+            return
+
+        start = self.text.index("insert")
+        self.text.insert("insert", value)
+        end = self.text.index("insert")
+        if self.text.compare(end, ">", start):
+            tag = self.ensure_format_tag(style)
+            self.text.tag_add(tag, start, end)
+
+    def _drawing_width_px(self, drawing):
+        # OOXML stores drawing extents in EMU. 914400 EMU = 1 inch.
+        # We use the same 96 DPI mapping as the saver.
+        try:
+            for extent in drawing.iter(qn("wp:extent")):
+                cx = extent.get("cx")
+                if cx:
+                    return max(1, int(round(int(cx) / 914400 * 96)))
+        except Exception:
+            pass
+        return None
+
+    def _insert_docx_drawing(self, document, drawing):
+        display_width_px = self._drawing_width_px(drawing)
+
+        for blip in drawing.iter(qn("a:blip")):
+            rel_id = blip.get(qn("r:embed"))
+            if not rel_id:
+                continue
+            part = document.part.related_parts.get(rel_id)
+            if part is None:
+                continue
+            blob = getattr(part, "blob", None)
+            if blob:
+                self.insert_image_bytes(
+                    blob,
+                    mark_modified=False,
+                    display_width_px=display_width_px,
+                )
+
+    def load_docx(self, path):
+        document = Document(path)
+
+        self._loading_document = True
+        try:
+            self.text.delete("1.0", "end")
+            self.embedded_images.clear()
+
+            for p_index, paragraph in enumerate(document.paragraphs):
+                if p_index:
+                    self.text.insert("insert", "\n")
+
+                for run in paragraph.runs:
+                    style = self._style_from_docx_run(run)
+
+                    # Preserve the order of text, tabs, line breaks and inline
+                    # drawings inside the run.
+                    for child in run._r.iterchildren():
+                        if child.tag == qn("w:rPr"):
+                            continue
+                        if child.tag == qn("w:t"):
+                            self._insert_loaded_text(child.text or "", style)
+                        elif child.tag == qn("w:tab"):
+                            self._insert_loaded_text("\t", style)
+                        elif child.tag == qn("w:br"):
+                            self._insert_loaded_text("\n", style)
+                        elif child.tag == qn("w:drawing"):
+                            self._insert_docx_drawing(document, child)
+
+            self.text.mark_set("insert", "end-1c")
+            self.text.edit_modified(False)
+
+            try:
+                end = self.text.index("end-1c")
+                if self.text.compare(end, ">", "1.0"):
+                    probe = self.text.index(f"{end} -1c")
+                    self.set_typing_style(self.style_at(probe))
+            except tk.TclError:
+                pass
+        finally:
+            self._loading_document = False
+
+        self.app.sync_format_controls(use_typing_style=True)
 
     def apply_typing_style_to_recent_insert(self):
         if self._pending_insert_start is None:
@@ -154,12 +653,195 @@ class NoteTab:
     def on_caret_moved(self, event=None):
         self.app.sync_format_controls(update_typing_style=True)
 
+    def on_editor_click(self, event=None):
+        self.select_image_at_pointer(event)
+        self.app.sync_format_controls(update_typing_style=True)
+        return None
+
+    def select_image_at_pointer(self, event):
+        selected = None
+
+        if event is not None:
+            for name in self.text.image_names():
+                try:
+                    box = self.text.bbox(name)
+                except tk.TclError:
+                    box = None
+
+                if not box:
+                    continue
+
+                x, y, width, height = box
+                if x <= event.x <= x + width and y <= event.y <= y + height:
+                    selected = name
+                    break
+
+        self.select_image(selected)
+
+    def select_image(self, image_name):
+        if image_name and image_name not in self.text.image_names():
+            image_name = None
+
+        self.selected_image_name = image_name
+
+        if image_name:
+            self.show_image_resize_handles()
+        else:
+            self.hide_image_resize_handles()
+
+        self.app.sync_image_menu_state()
+
+    def schedule_image_handle_refresh(self, event=None):
+        if self._image_handle_refresh_job is not None:
+            try:
+                self.text.after_cancel(self._image_handle_refresh_job)
+            except tk.TclError:
+                pass
+
+        self._image_handle_refresh_job = self.text.after(
+            15,
+            self.refresh_image_resize_handles,
+        )
+
+    def _make_resize_handle(self, corner):
+        handle = tk.Frame(
+            self.text,
+            width=10,
+            height=10,
+            background="#ffffff",
+            highlightbackground="#2563eb",
+            highlightcolor="#2563eb",
+            highlightthickness=2,
+            borderwidth=0,
+            cursor="size_nw_se" if corner in ("nw", "se") else "size_ne_sw",
+        )
+
+        handle.bind(
+            "<ButtonPress-1>",
+            lambda event, c=corner: self.begin_image_corner_resize(event, c),
+        )
+        handle.bind(
+            "<B1-Motion>",
+            lambda event, c=corner: self.drag_image_corner_resize(event, c),
+        )
+        handle.bind(
+            "<ButtonRelease-1>",
+            self.end_image_corner_resize,
+        )
+        return handle
+
+    def show_image_resize_handles(self):
+        if not self.selected_image_name:
+            self.hide_image_resize_handles()
+            return
+
+        if not self.image_resize_handles:
+            for corner in ("nw", "ne", "sw", "se"):
+                self.image_resize_handles[corner] = self._make_resize_handle(corner)
+
+        self.refresh_image_resize_handles()
+
+    def hide_image_resize_handles(self):
+        for handle in self.image_resize_handles.values():
+            try:
+                handle.place_forget()
+            except tk.TclError:
+                pass
+
+    def refresh_image_resize_handles(self):
+        self._image_handle_refresh_job = None
+
+        if not self.selected_image_name:
+            self.hide_image_resize_handles()
+            return
+
+        try:
+            box = self.text.bbox(self.selected_image_name)
+        except tk.TclError:
+            box = None
+
+        if not box:
+            self.hide_image_resize_handles()
+            return
+
+        x, y, width, height = box
+        half = 5
+
+        positions = {
+            "nw": (x - half, y - half),
+            "ne": (x + width - half, y - half),
+            "sw": (x - half, y + height - half),
+            "se": (x + width - half, y + height - half),
+        }
+
+        for corner, (px, py) in positions.items():
+            handle = self.image_resize_handles.get(corner)
+            if handle is not None:
+                handle.place(x=px, y=py, width=10, height=10)
+                handle.lift()
+
+    def begin_image_corner_resize(self, event, corner):
+        meta = self.get_selected_image_meta()
+        if not meta:
+            return "break"
+
+        try:
+            current_width = int(
+                meta.get("display_width_px") or meta["pixel_size"][0]
+            )
+        except (KeyError, TypeError, ValueError):
+            return "break"
+
+        self._image_resize_drag = {
+            "corner": corner,
+            "start_x_root": event.x_root,
+            "start_width": current_width,
+        }
+        return "break"
+
+    def drag_image_corner_resize(self, event, corner):
+        drag = self._image_resize_drag
+        if not drag or drag.get("corner") != corner:
+            return "break"
+
+        delta_x = event.x_root - drag["start_x_root"]
+        direction = 1 if corner in ("ne", "se") else -1
+        new_width = drag["start_width"] + direction * delta_x
+
+        self.resize_selected_image(
+            new_width,
+            save_state=False,
+            refresh_handles=True,
+        )
+        return "break"
+
+    def end_image_corner_resize(self, event=None):
+        if self._image_resize_drag is None:
+            return "break"
+
+        self._image_resize_drag = None
+        self.saved = False
+        self.app.update_tab_title(self)
+        self.app.save_state()
+        self.schedule_image_handle_refresh()
+        return "break"
+
+    def get_selected_image_meta(self):
+        if not self.selected_image_name:
+            return None
+        if self.selected_image_name not in self.text.image_names():
+            self.selected_image_name = None
+            self.hide_image_resize_handles()
+            self.app.sync_image_menu_state()
+            return None
+        return self.embedded_images.get(self.selected_image_name)
+
     def ensure_temp_path(self):
         if self.temp_path:
             return
         temp_dir = Path(tempfile.gettempdir()) / "autosave_notepad"
         temp_dir.mkdir(parents=True, exist_ok=True)
-        fd, path = tempfile.mkstemp(prefix="note_", suffix=".txt", dir=temp_dir)
+        fd, path = tempfile.mkstemp(prefix="note_", suffix=".docx", dir=temp_dir)
         os.close(fd)
         self.temp_path = path
 
@@ -180,9 +862,13 @@ class NoteTab:
     def on_modified(self, event=None):
         if not self.text.edit_modified():
             return
+        if self._loading_document:
+            self.text.edit_modified(False)
+            return
         self.saved = False
         self.app.update_tab_title(self)
-        self.write_temp_snapshot()
+        # DOCX creation is intentionally not done on every keystroke.
+        # Periodic autosave writes a complete recovery document.
         self.app.save_state()
         self.text.edit_modified(False)
 
@@ -194,9 +880,9 @@ class NoteTab:
     def write_temp_snapshot(self):
         try:
             self.ensure_temp_path()
-            Path(self.temp_path).write_text(self.get_content(), encoding="utf-8")
-        except OSError as e:
-            self.app.set_status(f"Autosave návrhu selhal: {e}")
+            self.save_docx(self.temp_path)
+        except (OSError, ValueError) as e:
+            self.app.set_status(f"Autosave DOCX návrhu selhal: {e}")
 
     def mark_saved(self, file_path=None):
         if file_path:
@@ -340,7 +1026,10 @@ class AutoSaveNotepadApp:
         notebook_wrap.pack(fill="both", expand=True)
         self.notebook = ttk.Notebook(notebook_wrap)
         self.notebook.pack(fill="both", expand=True, padx=6, pady=(5, 0))
-        self.notebook.bind("<<NotebookTabChanged>>", lambda e: self.sync_format_controls())
+        self.notebook.bind(
+            "<<NotebookTabChanged>>",
+            self.on_notebook_tab_changed,
+        )
 
         self.status_var = tk.StringVar(value="Připraveno")
         ttk.Separator(self.root, orient="horizontal").pack(fill="x", side="bottom")
@@ -443,6 +1132,7 @@ class AutoSaveNotepadApp:
         edit_menu.add_command(label="Vyjmout", command=lambda: self.text_event("event_generate", "<<Cut>>"), accelerator="Ctrl+X")
         edit_menu.add_command(label="Kopírovat", command=lambda: self.text_event("event_generate", "<<Copy>>"), accelerator="Ctrl+C")
         edit_menu.add_command(label="Vložit", command=lambda: self.text_event("event_generate", "<<Paste>>"), accelerator="Ctrl+V")
+        edit_menu.add_command(label="Vložit obrázek ze schránky", command=self.paste_image_current_tab)
         edit_menu.add_separator()
         edit_menu.add_command(label="Přejmenovat kartu", command=self.rename_current_tab, accelerator="F2")
         menubar.add_cascade(label="Úpravy", menu=edit_menu)
@@ -456,6 +1146,38 @@ class AutoSaveNotepadApp:
             format_menu.add_command(label=f"{size} pt", command=lambda s=size: self.set_font_size(s))
         menubar.add_cascade(label="Formát", menu=format_menu)
 
+        image_menu = tk.Menu(menubar, tearoff=0)
+        image_menu.add_command(
+            label="Vložit ze schránky",
+            command=self.paste_image_current_tab,
+        )
+        image_menu.add_separator()
+        image_menu.add_command(
+            label="Zmenšit o 10 %",
+            command=lambda: self.scale_selected_image(0.9),
+        )
+        image_menu.add_command(
+            label="Zvětšit o 10 %",
+            command=lambda: self.scale_selected_image(1.1),
+        )
+        image_menu.add_command(
+            label="Nastavit přesnou šířku...",
+            command=self.prompt_image_width,
+        )
+        image_menu.add_separator()
+        image_menu.add_command(
+            label="Původní velikost",
+            command=self.reset_selected_image_size,
+        )
+        image_menu.add_command(
+            label="Přizpůsobit šířce okna",
+            command=self.fit_selected_image,
+        )
+
+        self.image_menu = image_menu
+        self.image_menu_edit_indices = (2, 3, 4, 6, 7)
+        menubar.add_cascade(label="Obrázek", menu=image_menu)
+
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="Zkontrolovat aktualizace", command=self.check_for_updates_manual)
         help_menu.add_command(label="Nastavit GitHub přístup", command=self.configure_github_token)
@@ -464,6 +1186,7 @@ class AutoSaveNotepadApp:
         menubar.add_cascade(label="Nápověda", menu=help_menu)
 
         self.root.config(menu=menubar)
+        self.root.after_idle(self.sync_image_menu_state)
         self.root.bind("<Control-n>", lambda e: self.new_tab())
         self.root.bind("<Control-o>", lambda e: self.open_file())
         self.root.bind("<Control-s>", lambda e: self.save_current_file())
@@ -559,6 +1282,15 @@ class AutoSaveNotepadApp:
             button.pack(side="left", padx=(0, 4))
             button.bind("<Shift-MouseWheel>", horizontal_mousewheel)
 
+        image_button = ttk.Button(
+            file_group,
+            text="Vložit obrázek",
+            command=self.paste_image_current_tab,
+            style="Toolbar.TButton",
+        )
+        image_button.pack(side="left", padx=(0, 4))
+        image_button.bind("<Shift-MouseWheel>", horizontal_mousewheel)
+
         sep1 = ttk.Separator(toolbar, orient="vertical")
         sep1.pack(side="left", fill="y", padx=(8, 10), pady=2)
         sep1.bind("<Shift-MouseWheel>", horizontal_mousewheel)
@@ -652,6 +1384,86 @@ class AutoSaveNotepadApp:
         )
         button.pack(side="left", padx=(0, 4))
         return button
+
+    def paste_image_current_tab(self):
+        tab = self.current_tab()
+        if not tab:
+            return
+        if not tab.paste_image_from_clipboard():
+            messagebox.showinfo(
+                "Vložit obrázek",
+                "Ve schránce není obrázek.",
+                parent=self.root,
+            )
+
+    def on_notebook_tab_changed(self, event=None):
+        for tab in self.tabs:
+            if tab is not self.current_tab():
+                tab.hide_image_resize_handles()
+
+        self.sync_format_controls()
+        self.sync_image_menu_state()
+
+        tab = self.current_tab()
+        if tab and tab.selected_image_name:
+            tab.schedule_image_handle_refresh()
+
+    def sync_image_menu_state(self):
+        menu = getattr(self, "image_menu", None)
+        if menu is None:
+            return
+
+        tab = self.current_tab()
+        meta = tab.get_selected_image_meta() if tab else None
+        state = "normal" if meta else "disabled"
+
+        for index in getattr(self, "image_menu_edit_indices", ()):
+            try:
+                menu.entryconfigure(index, state=state)
+            except tk.TclError:
+                pass
+
+    def prompt_image_width(self):
+        tab = self.current_tab()
+        meta = tab.get_selected_image_meta() if tab else None
+        if not meta:
+            return
+
+        try:
+            current = int(
+                meta.get("display_width_px") or meta["pixel_size"][0]
+            )
+        except (KeyError, TypeError, ValueError):
+            return
+
+        width = simpledialog.askinteger(
+            "Velikost obrázku",
+            "Šířka obrázku v pixelech:",
+            initialvalue=current,
+            minvalue=40,
+            maxvalue=6000,
+            parent=self.root,
+        )
+        if width is None:
+            return
+
+        tab.resize_selected_image(width)
+        self.sync_image_menu_state()
+
+    def scale_selected_image(self, factor):
+        tab = self.current_tab()
+        if tab and tab.scale_selected_image(factor):
+            self.sync_image_menu_state()
+
+    def reset_selected_image_size(self):
+        tab = self.current_tab()
+        if tab and tab.reset_selected_image_size():
+            self.sync_image_menu_state()
+
+    def fit_selected_image(self):
+        tab = self.current_tab()
+        if tab and tab.fit_selected_image_to_window():
+            self.sync_image_menu_state()
 
     def current_tab(self):
         current = self.notebook.select()
@@ -837,20 +1649,32 @@ class AutoSaveNotepadApp:
 
     def export_tab_to_autosave_folder(self, tab):
         try:
-            path = self.ensure_autosave_directory() / (self.sanitize_filename(tab.get_title()) + ".txt")
-            if tab.export_path and Path(tab.export_path) != path and Path(tab.export_path).exists():
+            path = self.ensure_autosave_directory() / (
+                self.sanitize_filename(tab.get_title()) + ".docx"
+            )
+            if (
+                tab.export_path
+                and Path(tab.export_path) != path
+                and Path(tab.export_path).exists()
+            ):
                 try:
                     Path(tab.export_path).unlink()
                 except OSError:
                     pass
-            path.write_text(tab.get_content(), encoding="utf-8")
+
+            tab.save_docx(path)
             tab.export_path = str(path)
-        except OSError as e:
-            self.set_status(f"Automatické uložení selhalo: {e}")
+        except (OSError, ValueError) as e:
+            self.set_status(f"Automatické uložení DOCX selhalo: {e}")
 
     def delete_tab_export_file(self, tab):
         try:
-            path = Path(tab.export_path) if tab.export_path else                 self.ensure_autosave_directory() / (self.sanitize_filename(tab.get_title()) + ".txt")
+            path = (
+                Path(tab.export_path)
+                if tab.export_path
+                else self.ensure_autosave_directory()
+                / (self.sanitize_filename(tab.get_title()) + ".docx")
+            )
             if path.exists():
                 path.unlink()
             tab.export_path = None
@@ -869,17 +1693,51 @@ class AutoSaveNotepadApp:
         ms = max(1000, int(self.settings.get("autosave_interval_seconds", 10) * 1000))
         self.periodic_autosave_job = self.root.after(ms, self.run_periodic_autosave)
 
-    def new_tab(self, content="", title=None, file_path=None, temp_path=None,
-                custom_title=None, prompt_for_name=True, formatting=None):
+    def new_tab(
+        self,
+        content="",
+        title=None,
+        file_path=None,
+        temp_path=None,
+        custom_title=None,
+        prompt_for_name=True,
+        formatting=None,
+        images=None,
+        document_path=None,
+    ):
         if custom_title is None and prompt_for_name:
             custom_title = self.prompt_unique_tab_name(title="Nová karta", prompt="Zadej název nové karty:")
             if custom_title is None:
                 return None
         title = title or custom_title or f"{UNTITLED_PREFIX} {len(self.tabs) + 1}"
-        tab = NoteTab(self, title, content, file_path, custom_title, formatting)
+        tab = NoteTab(
+            self,
+            title,
+            content,
+            file_path,
+            custom_title,
+            formatting,
+            images,
+        )
         if temp_path:
             tab.temp_path = temp_path
             tab.write_temp_snapshot()
+        if document_path:
+            try:
+                tab.load_docx(document_path)
+                tab.write_temp_snapshot()
+            except Exception as e:
+                try:
+                    self.notebook.forget(tab.frame)
+                except tk.TclError:
+                    pass
+                messagebox.showerror(
+                    "Otevření DOCX",
+                    f"Dokument se nepodařilo otevřít:\n{e}",
+                    parent=self.root,
+                )
+                return None
+
         self.tabs.append(tab)
         self.notebook.select(tab.frame)
         self.update_tab_title(tab)
@@ -924,7 +1782,7 @@ class AutoSaveNotepadApp:
 
         ttk.Label(frame, text="Interval autosave (sekundy):").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(frame, textvariable=interval, width=12).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(frame, text="Složka autosave:").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(frame, text="Složka automaticky ukládaných DOCX:").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Entry(frame, textvariable=directory, width=45).grid(row=1, column=1, sticky="ew", pady=4)
         ttk.Button(frame, text="Procházet...", command=lambda: directory.set(
             filedialog.askdirectory(initialdir=directory.get() or str(Path.home())) or directory.get()
@@ -967,34 +1825,83 @@ class AutoSaveNotepadApp:
 
     def open_file(self):
         path = filedialog.askopenfilename(
-            title="Otevřít textový soubor",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+            title="Otevřít dokument",
+            filetypes=[
+                ("Word documents", "*.docx"),
+                ("Staré textové poznámky", "*.txt"),
+                ("All files", "*.*"),
+            ],
         )
         if not path:
             return
-        try:
-            try:
-                content = Path(path).read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = Path(path).read_text(encoding="cp1250")
-        except OSError as e:
-            messagebox.showerror("Chyba", f"Soubor nešlo otevřít:\n{e}")
-            return
-        name = self.sanitize_filename(Path(path).stem)
+
+        source = Path(path)
+        name = self.sanitize_filename(source.stem)
         if name.lower() in self.get_used_titles():
-            name = self.prompt_unique_tab_name(name, "Duplicitní název", "Zadej jiný název karty:")
+            name = self.prompt_unique_tab_name(
+                name,
+                "Duplicitní název",
+                "Zadej jiný název karty:",
+            )
             if name is None:
                 return
-        tab = self.new_tab(content=content, title=name, file_path=path,
-                           custom_title=name, prompt_for_name=False)
-        if tab:
-            tab.mark_saved(path)
+
+        if source.suffix.lower() == ".docx":
+            tab = self.new_tab(
+                title=name,
+                file_path=str(source),
+                custom_title=name,
+                prompt_for_name=False,
+                document_path=str(source),
+            )
+            if tab:
+                tab.saved = True
+                self.update_tab_title(tab)
+                self.save_state()
+                self.set_status(f"Otevřen DOCX: {source}")
+            return
+
+        if source.suffix.lower() == ".txt":
+            try:
+                try:
+                    content = source.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    content = source.read_text(encoding="cp1250")
+            except OSError as e:
+                messagebox.showerror(
+                    "Chyba",
+                    f"Soubor nešlo otevřít:\n{e}",
+                    parent=self.root,
+                )
+                return
+
+            # TXT is import-only. Saving creates a new DOCX.
+            tab = self.new_tab(
+                content=content,
+                title=name,
+                file_path=None,
+                custom_title=name,
+                prompt_for_name=False,
+            )
+            if tab:
+                tab.saved = False
+                self.update_tab_title(tab)
+                self.set_status(
+                    "Starý TXT byl importován. Při uložení vznikne DOCX."
+                )
+            return
+
+        messagebox.showerror(
+            "Nepodporovaný formát",
+            "Aplikace ukládá dokumenty jako DOCX. Otevřít lze DOCX nebo starý TXT pro import.",
+            parent=self.root,
+        )
 
     def save_current_file(self, event=None):
         tab = self.current_tab()
         if not tab:
             return
-        if tab.file_path:
+        if tab.file_path and Path(tab.file_path).suffix.lower() == ".docx":
             self.write_to_path(tab, tab.file_path)
         else:
             self.save_current_file_as()
@@ -1003,22 +1910,31 @@ class AutoSaveNotepadApp:
         tab = self.current_tab()
         if not tab:
             return
+
         path = filedialog.asksaveasfilename(
-            title="Uložit jako",
-            initialfile=self.sanitize_filename(tab.get_title()) + ".txt",
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+            title="Uložit jako DOCX",
+            initialfile=self.sanitize_filename(tab.get_title()) + ".docx",
+            defaultextension=".docx",
+            filetypes=[("Word documents", "*.docx")],
         )
         if path:
             self.write_to_path(tab, path)
 
     def write_to_path(self, tab, path):
+        path = Path(path)
+        if path.suffix.lower() != ".docx":
+            path = path.with_suffix(".docx")
+
         try:
-            Path(path).write_text(tab.get_content(), encoding="utf-8")
-            tab.mark_saved(path)
-            self.set_status(f"Uloženo: {path}")
-        except OSError as e:
-            messagebox.showerror("Chyba ukládání", f"Soubor nešlo uložit:\n{e}")
+            tab.save_docx(path)
+            tab.mark_saved(str(path))
+            self.set_status(f"Uloženo jako DOCX: {path}")
+        except (OSError, ValueError) as e:
+            messagebox.showerror(
+                "Chyba ukládání",
+                f"DOCX se nepodařilo uložit:\n{e}",
+                parent=self.root,
+            )
 
     def close_current_tab(self, event=None):
         tab = self.current_tab()
@@ -1041,6 +1957,7 @@ class AutoSaveNotepadApp:
                 return
             tab.delete_export_file()
             tab.delete_temp_snapshot()
+        tab.hide_image_resize_handles()
         self.notebook.forget(tab.frame)
         self.tabs.remove(tab)
         self.save_state()
@@ -1206,7 +2123,12 @@ class AutoSaveNotepadApp:
             )
 
     def show_about(self):
-        messagebox.showinfo("O programu", f"{APP_NAME}\nVerze {APP_VERSION}\n\n{GITHUB_OWNER}/{GITHUB_REPO}")
+        messagebox.showinfo(
+            "O programu",
+            f"{APP_NAME}\nVerze {APP_VERSION}\n\n"
+            "Dokumenty se ukládají ve formátu DOCX včetně formátování a obrázků.\n\n"
+            f"{GITHUB_OWNER}/{GITHUB_REPO}",
+        )
 
     def set_status(self, text):
         self.status_var.set(text)
@@ -1215,7 +2137,6 @@ class AutoSaveNotepadApp:
         data = {"tabs": [], "settings": self.settings}
         for tab in self.tabs:
             try:
-                tab.write_temp_snapshot()
                 data["tabs"].append({
                     "title": tab.get_title(),
                     "file_path": tab.file_path,
@@ -1223,7 +2144,6 @@ class AutoSaveNotepadApp:
                     "temp_path": tab.temp_path,
                     "saved": tab.saved,
                     "export_path": tab.export_path,
-                    "formatting": tab.serialize_formatting(),
                 })
             except Exception:
                 pass
@@ -1248,30 +2168,57 @@ class AutoSaveNotepadApp:
         self.settings["check_updates_on_start"] = bool(settings.get("check_updates_on_start", True))
 
         for item in data.get("tabs", []):
-            content = ""
             temp_path = item.get("temp_path")
             file_path = item.get("file_path")
-            source = temp_path if temp_path and os.path.exists(temp_path) else file_path
-            if source and os.path.exists(source):
+
+            source = None
+            if temp_path and os.path.exists(temp_path):
+                source = Path(temp_path)
+            elif file_path and os.path.exists(file_path):
+                source = Path(file_path)
+
+            tab = None
+
+            if source and source.suffix.lower() == ".docx":
+                tab = self.new_tab(
+                    title=item.get("title") or UNTITLED_PREFIX,
+                    file_path=file_path if file_path and Path(file_path).suffix.lower() == ".docx" else None,
+                    custom_title=item.get("custom_title"),
+                    prompt_for_name=False,
+                    document_path=str(source),
+                )
+            elif source and source.suffix.lower() == ".txt":
+                # Migration from pre-DOCX versions.
                 try:
-                    content = Path(source).read_text(encoding="utf-8")
+                    try:
+                        content = source.read_text(encoding="utf-8")
+                    except UnicodeDecodeError:
+                        content = source.read_text(encoding="cp1250")
                 except OSError:
-                    pass
-            tab = self.new_tab(
-                content=content,
-                title=item.get("title") or UNTITLED_PREFIX,
-                file_path=file_path,
-                temp_path=temp_path,
-                custom_title=item.get("custom_title"),
-                prompt_for_name=False,
-                formatting=item.get("formatting") or [],
-            )
+                    content = ""
+
+                tab = self.new_tab(
+                    content=content,
+                    title=item.get("title") or UNTITLED_PREFIX,
+                    file_path=None,
+                    custom_title=item.get("custom_title"),
+                    prompt_for_name=False,
+                )
+                if tab:
+                    tab.saved = False
+            elif not source:
+                continue
+
             if tab:
-                tab.saved = item.get("saved", True)
-                tab.export_path = item.get("export_path")
+                tab.saved = item.get("saved", True) if source and source.suffix.lower() == ".docx" else False
+                old_export = item.get("export_path")
+                if old_export and Path(old_export).suffix.lower() == ".docx":
+                    tab.export_path = old_export
                 self.update_tab_title(tab)
 
     def on_close(self):
+        for tab in self.tabs:
+            tab.write_temp_snapshot()
         self.save_state()
         if self.periodic_autosave_job is not None:
             self.root.after_cancel(self.periodic_autosave_job)
