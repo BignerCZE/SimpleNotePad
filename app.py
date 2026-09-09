@@ -18,7 +18,7 @@ from docx.shared import Inches, Pt
 from updater import GitHubUpdater, UpdateError
 
 APP_NAME = "AutoSave Notepad"
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 GITHUB_OWNER = "BignerCZE"
 GITHUB_REPO = "SimpleNotePad"
 
@@ -1115,6 +1115,7 @@ class AutoSaveNotepadApp:
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Nová karta", command=self.new_tab, accelerator="Ctrl+N")
         file_menu.add_command(label="Otevřít...", command=self.open_file, accelerator="Ctrl+O")
+        file_menu.add_command(label="Tisk...", command=self.print_current_document, accelerator="Ctrl+P")
         file_menu.add_separator()
         file_menu.add_command(label="Uložit", command=self.save_current_file, accelerator="Ctrl+S")
         file_menu.add_command(label="Uložit jako...", command=self.save_current_file_as)
@@ -1189,6 +1190,7 @@ class AutoSaveNotepadApp:
         self.root.after_idle(self.sync_image_menu_state)
         self.root.bind("<Control-n>", lambda e: self.new_tab())
         self.root.bind("<Control-o>", lambda e: self.open_file())
+        self.root.bind("<Control-p>", lambda e: self.print_current_document())
         self.root.bind("<Control-s>", lambda e: self.save_current_file())
         self.root.bind("<Control-w>", lambda e: self.close_current_tab())
         self.root.bind("<F2>", lambda e: self.rename_current_tab())
@@ -1282,14 +1284,14 @@ class AutoSaveNotepadApp:
             button.pack(side="left", padx=(0, 4))
             button.bind("<Shift-MouseWheel>", horizontal_mousewheel)
 
-        image_button = ttk.Button(
+        print_button = ttk.Button(
             file_group,
-            text="Vložit obrázek",
-            command=self.paste_image_current_tab,
+            text="Tisk",
+            command=self.print_current_document,
             style="Toolbar.TButton",
         )
-        image_button.pack(side="left", padx=(0, 4))
-        image_button.bind("<Shift-MouseWheel>", horizontal_mousewheel)
+        print_button.pack(side="left", padx=(0, 4))
+        print_button.bind("<Shift-MouseWheel>", horizontal_mousewheel)
 
         sep1 = ttk.Separator(toolbar, orient="vertical")
         sep1.pack(side="left", fill="y", padx=(8, 10), pady=2)
@@ -1897,6 +1899,208 @@ class AutoSaveNotepadApp:
             parent=self.root,
         )
 
+    def _windows_print_dialog(self):
+        """Show the native Windows print dialog and return printer info."""
+        if os.name != "nt":
+            raise OSError("Tiskový dialog je v této verzi podporován pouze ve Windows.")
+
+        import ctypes
+        from ctypes import wintypes
+
+        PD_NOSELECTION = 0x00000004
+        PD_NOPAGENUMS = 0x00000008
+        PD_HIDEPRINTTOFILE = 0x00100000
+        PD_USEDEVMODECOPIESANDCOLLATE = 0x00040000
+
+        class PRINTDLGW(ctypes.Structure):
+            _fields_ = [
+                ("lStructSize", wintypes.DWORD),
+                ("hwndOwner", wintypes.HWND),
+                ("hDevMode", wintypes.HGLOBAL),
+                ("hDevNames", wintypes.HGLOBAL),
+                ("hDC", wintypes.HDC),
+                ("Flags", wintypes.DWORD),
+                ("nFromPage", wintypes.WORD),
+                ("nToPage", wintypes.WORD),
+                ("nMinPage", wintypes.WORD),
+                ("nMaxPage", wintypes.WORD),
+                ("nCopies", wintypes.WORD),
+                ("hInstance", wintypes.HINSTANCE),
+                ("lCustData", wintypes.LPARAM),
+                ("lpfnPrintHook", ctypes.c_void_p),
+                ("lpfnSetupHook", ctypes.c_void_p),
+                ("lpPrintTemplateName", wintypes.LPCWSTR),
+                ("lpSetupTemplateName", wintypes.LPCWSTR),
+                ("hPrintTemplate", wintypes.HGLOBAL),
+                ("hSetupTemplate", wintypes.HGLOBAL),
+            ]
+
+        comdlg32 = ctypes.WinDLL("comdlg32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        comdlg32.PrintDlgW.argtypes = [ctypes.POINTER(PRINTDLGW)]
+        comdlg32.PrintDlgW.restype = wintypes.BOOL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+        dialog = PRINTDLGW()
+        dialog.lStructSize = ctypes.sizeof(PRINTDLGW)
+        dialog.hwndOwner = self.root.winfo_id()
+        dialog.Flags = (
+            PD_NOSELECTION
+            | PD_NOPAGENUMS
+            | PD_HIDEPRINTTOFILE
+            | PD_USEDEVMODECOPIESANDCOLLATE
+        )
+        dialog.nCopies = 1
+
+        if not comdlg32.PrintDlgW(ctypes.byref(dialog)):
+            # Cancel is not an error. CommDlgExtendedError returns zero on cancel.
+            error_code = comdlg32.CommDlgExtendedError()
+            if error_code:
+                raise OSError(f"Windows tiskový dialog selhal (0x{error_code:08X}).")
+            return None
+
+        printer = None
+        driver = ""
+        output = ""
+
+        try:
+            if dialog.hDevNames:
+                ptr = kernel32.GlobalLock(dialog.hDevNames)
+                if ptr:
+                    try:
+                        # DEVNAMES contains four WORD offsets. The offsets are
+                        # measured in UTF-16 characters from the structure start.
+                        offsets = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ushort))
+                        driver_offset = offsets[0]
+                        device_offset = offsets[1]
+                        output_offset = offsets[2]
+
+                        base = int(ptr)
+                        driver = ctypes.wstring_at(base + driver_offset * 2)
+                        printer = ctypes.wstring_at(base + device_offset * 2)
+                        output = ctypes.wstring_at(base + output_offset * 2)
+                    finally:
+                        kernel32.GlobalUnlock(dialog.hDevNames)
+        finally:
+            if dialog.hDevMode:
+                kernel32.GlobalFree(dialog.hDevMode)
+            if dialog.hDevNames:
+                kernel32.GlobalFree(dialog.hDevNames)
+
+        if not printer:
+            raise OSError("Z tiskového dialogu se nepodařilo zjistit vybranou tiskárnu.")
+
+        return {
+            "printer": printer,
+            "driver": driver,
+            "output": output,
+            "copies": max(1, int(dialog.nCopies or 1)),
+        }
+
+    def _create_print_snapshot(self, tab):
+        print_dir = Path(tempfile.gettempdir()) / "AutoSaveNotepad_print"
+        print_dir.mkdir(parents=True, exist_ok=True)
+
+        # Remove old print snapshots. Current jobs remain untouched because only
+        # files older than one day are removed.
+        try:
+            import time
+            cutoff = time.time() - 86400
+            for old_file in print_dir.glob("*.docx"):
+                try:
+                    if old_file.stat().st_mtime < cutoff:
+                        old_file.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+        safe_title = self.sanitize_filename(tab.get_title()) or "Poznamka"
+        snapshot = print_dir / f"{safe_title}_{uuid.uuid4().hex}.docx"
+        tab.save_docx(snapshot)
+        return snapshot
+
+    def _send_docx_to_printer(self, path, printer_info):
+        if os.name != "nt":
+            raise OSError("Tisk je v této verzi podporován pouze ve Windows.")
+
+        import ctypes
+
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ShellExecuteW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_int,
+        ]
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+
+        printer = printer_info["printer"]
+        driver = printer_info.get("driver", "")
+        output = printer_info.get("output", "")
+        copies = max(1, int(printer_info.get("copies", 1)))
+
+        parameters = f'"{printer}" "{driver}" "{output}"'
+
+        for _ in range(copies):
+            result = shell32.ShellExecuteW(
+                None,
+                "printto",
+                str(path),
+                parameters,
+                str(path.parent),
+                0,
+            )
+            code = int(result or 0)
+            if code <= 32:
+                raise OSError(
+                    "Windows nedokázal předat DOCX tiskové aplikaci "
+                    f"(ShellExecute kód {code})."
+                )
+
+    def print_current_document(self, event=None):
+        tab = self.current_tab()
+        if not tab:
+            return "break" if event is not None else None
+
+        if os.name != "nt":
+            messagebox.showerror(
+                "Tisk",
+                "Tisk je v této verzi podporován pouze ve Windows.",
+                parent=self.root,
+            )
+            return "break" if event is not None else None
+
+        try:
+            printer_info = self._windows_print_dialog()
+            if printer_info is None:
+                return "break" if event is not None else None
+
+            snapshot = self._create_print_snapshot(tab)
+            self._send_docx_to_printer(snapshot, printer_info)
+            self.set_status(
+                f"Dokument byl předán k tisku: {printer_info['printer']}"
+            )
+        except Exception as e:
+            messagebox.showerror(
+                "Tisk",
+                "Dokument se nepodařilo vytisknout.\n\n"
+                f"{e}\n\n"
+                "Pro tisk DOCX musí být ve Windows nainstalována aplikace, "
+                "která podporuje systémovou akci Tisk (typicky Microsoft Word).",
+                parent=self.root,
+            )
+
+        return "break" if event is not None else None
+
     def save_current_file(self, event=None):
         tab = self.current_tab()
         if not tab:
@@ -2126,7 +2330,8 @@ class AutoSaveNotepadApp:
         messagebox.showinfo(
             "O programu",
             f"{APP_NAME}\nVerze {APP_VERSION}\n\n"
-            "Dokumenty se ukládají ve formátu DOCX včetně formátování a obrázků.\n\n"
+            "Dokumenty se ukládají ve formátu DOCX včetně formátování a obrázků.\n"
+            "Aktuální kartu lze tisknout přes Ctrl+P.\n\n"
             f"{GITHUB_OWNER}/{GITHUB_REPO}",
         )
 
