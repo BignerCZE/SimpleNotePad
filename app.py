@@ -4,6 +4,7 @@ import ctypes
 import re
 import sys
 import tempfile
+import threading
 import uuid
 from io import BytesIO
 import tkinter as tk
@@ -17,9 +18,10 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 
 from updater import GitHubUpdater, UpdateError
+from ocr_service import OcrError, recognize_image, available_ocr_languages
 
 APP_NAME = "AutoSave Notepad"
-APP_VERSION = "2.5.3"
+APP_VERSION = "2.6.4"
 
 WINDOWS_APP_ID = "BignerCZE.SimpleNotePad"
 
@@ -200,9 +202,12 @@ class NoteTab:
         return None
 
     def on_paste(self, event=None):
-        # Prefer an image if the Windows clipboard contains one; otherwise
-        # allow Tk's normal text paste and apply the active typing style.
-        if self.paste_image_from_clipboard():
+        # If the clipboard contains an image, ask whether it should stay an
+        # image or be converted to editable text. Plain-text clipboard content
+        # keeps the original Tk paste behavior.
+        image = self.get_clipboard_image()
+        if image is not None:
+            self.app.handle_clipboard_image(self, image)
             return "break"
 
         try:
@@ -216,33 +221,63 @@ class NoteTab:
         self.text.after_idle(self.apply_typing_style_to_recent_insert)
         return None
 
-    def paste_image_from_clipboard(self):
+    def get_clipboard_image(self):
         try:
             clipboard = ImageGrab.grabclipboard()
         except Exception:
-            return False
-
-        image = None
+            return None
 
         if isinstance(clipboard, Image.Image):
-            image = clipboard.copy()
-        elif isinstance(clipboard, list):
+            return clipboard.copy()
+
+        if isinstance(clipboard, list):
             # Windows may expose a copied image file as a list of paths.
             for item in clipboard:
                 try:
                     path = Path(item)
                     if path.is_file():
                         with Image.open(path) as opened:
-                            image = opened.convert("RGBA").copy()
-                        break
+                            return opened.convert("RGBA").copy()
                 except Exception:
                     continue
 
+        return None
+
+    def paste_image_from_clipboard(self):
+        """Direct image paste used by Obrázek -> Vložit ze schránky."""
+        image = self.get_clipboard_image()
         if image is None:
             return False
 
         self.insert_pil_image(image)
         return True
+
+    def insert_ocr_text(self, value):
+        if not value:
+            return
+
+        try:
+            if self.text.tag_ranges("sel"):
+                start = self.text.index("sel.first")
+                end = self.text.index("sel.last")
+                self.text.delete(start, end)
+                insert_at = start
+            else:
+                insert_at = self.text.index("insert")
+        except tk.TclError:
+            insert_at = self.text.index("insert")
+
+        self.text.mark_set("insert", insert_at)
+        start = self.text.index("insert")
+        self.text.insert("insert", value)
+        end = self.text.index("insert")
+
+        if self.text.compare(end, ">", start):
+            tag = self.ensure_format_tag(self.typing_style)
+            self.text.tag_add(tag, start, end)
+
+        self.text.edit_modified(True)
+        self.text.see("insert")
 
     def insert_pil_image(self, image, mark_modified=True):
         try:
@@ -1198,6 +1233,10 @@ class AutoSaveNotepadApp:
             label="Vložit ze schránky",
             command=self.paste_image_current_tab,
         )
+        image_menu.add_command(
+            label="Převést obrázek ze schránky na text",
+            command=self.ocr_clipboard_current_tab,
+        )
         image_menu.add_separator()
         image_menu.add_command(
             label="Zmenšit o 10 %",
@@ -1222,7 +1261,7 @@ class AutoSaveNotepadApp:
         )
 
         self.image_menu = image_menu
-        self.image_menu_edit_indices = (2, 3, 4, 6, 7)
+        self.image_menu_edit_indices = (3, 4, 5, 7, 8)
         menubar.add_cascade(label="Obrázek", menu=image_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
@@ -1432,6 +1471,360 @@ class AutoSaveNotepadApp:
         )
         button.pack(side="left", padx=(0, 4))
         return button
+
+    def _ask_clipboard_image_action(self):
+        """
+        Return 'image', 'ocr' or None.
+
+        A small modal dialog is used instead of askyesnocancel so the actions
+        can be named unambiguously.
+        """
+        result = {"value": None}
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Vložení obsahu schránky")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.configure(background=UI_BG)
+
+        # Use the same app icon as the main window.
+        if getattr(self, "_app_icon_photo", None) is not None:
+            try:
+                dialog.iconphoto(True, self._app_icon_photo)
+            except tk.TclError:
+                pass
+
+        body = ttk.Frame(dialog, padding=(22, 18, 22, 14))
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(
+            body,
+            text="Ve schránce je obrázek.",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w")
+
+        ttk.Label(
+            body,
+            text="Jak chcete obsah vložit?",
+        ).pack(anchor="w", pady=(5, 16))
+
+        buttons = ttk.Frame(body)
+        buttons.pack(fill="x")
+
+        def choose(value):
+            result["value"] = value
+            dialog.destroy()
+
+        image_button = ttk.Button(
+            buttons,
+            text="Vložit jako obrázek",
+            command=lambda: choose("image"),
+        )
+        image_button.pack(side="left", padx=(0, 8))
+
+        ocr_button = ttk.Button(
+            buttons,
+            text="Převést na text",
+            command=lambda: choose("ocr"),
+        )
+        ocr_button.pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            buttons,
+            text="Zrušit",
+            command=lambda: choose(None),
+        ).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        dialog.bind("<Escape>", lambda e: choose(None))
+
+        dialog.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (
+                self.root.winfo_width() - dialog.winfo_width()
+            ) // 2
+            y = self.root.winfo_rooty() + (
+                self.root.winfo_height() - dialog.winfo_height()
+            ) // 2
+            dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except tk.TclError:
+            pass
+
+        dialog.grab_set()
+        image_button.focus_set()
+        self.root.wait_window(dialog)
+
+        return result["value"]
+
+    def handle_clipboard_image(self, tab, image):
+        action = self._ask_clipboard_image_action()
+
+        if action == "image":
+            tab.insert_pil_image(image)
+            return
+
+        if action == "ocr":
+            self._start_ocr(tab, image)
+
+    def ocr_clipboard_current_tab(self):
+        tab = self.current_tab()
+        if not tab:
+            return
+
+        image = tab.get_clipboard_image()
+        if image is None:
+            messagebox.showinfo(
+                "Převod na text",
+                "Ve schránce není obrázek.",
+                parent=self.root,
+            )
+            return
+
+        self._start_ocr(tab, image)
+
+    def _start_ocr(self, tab, image):
+        if os.name != "nt":
+            messagebox.showerror(
+                "Převod na text",
+                "Lokální OCR je podporováno pouze ve Windows.",
+                parent=self.root,
+            )
+            return
+
+        # Copy now; clipboard content may change while the worker is running.
+        worker_image = image.convert("RGBA").copy()
+
+        self.set_status("Rozpoznávám text…")
+        self.root.config(cursor="wait")
+
+        def worker():
+            try:
+                text, language_tag = recognize_image(
+                    worker_image,
+                    preferred_language="cs-CZ",
+                )
+            except Exception as exc:
+                self.root.after(
+                    0,
+                    lambda e=exc: self._finish_ocr_error(e),
+                )
+                return
+
+            self.root.after(
+                0,
+                lambda t=text, lang=language_tag, target=tab:
+                    self._finish_ocr_success(target, t, lang),
+            )
+
+        threading.Thread(
+            target=worker,
+            name="SimpleNotePad-OCR",
+            daemon=True,
+        ).start()
+
+    def _finish_ocr_success(self, tab, text, language_tag):
+        self.root.config(cursor="")
+
+        if tab not in self.tabs:
+            self.set_status("OCR dokončeno, ale cílová karta už byla zavřena.")
+            return
+
+        cleaned = (text or "").strip()
+
+        if not cleaned:
+            self.set_status("OCR nenašlo žádný text.")
+            messagebox.showinfo(
+                "Převod na text",
+                "V obrázku nebyl rozpoznán žádný text.",
+                parent=self.root,
+            )
+            return
+
+        lang_info = f" ({language_tag})" if language_tag else ""
+        self.set_status(f"Text rozpoznán{lang_info}. Čeká na potvrzení.")
+
+        edited_text = self._show_ocr_preview_dialog(
+            cleaned,
+            language_tag=language_tag,
+        )
+
+        if edited_text is None:
+            self.set_status("Vložení rozpoznaného textu bylo zrušeno.")
+            return
+
+        final_text = edited_text.strip()
+        if not final_text:
+            self.set_status("OCR text nebyl vložen.")
+            messagebox.showinfo(
+                "Převod na text",
+                "Textové pole je prázdné. Do poznámky nebylo nic vloženo.",
+                parent=self.root,
+            )
+            return
+
+        # Insert only the final user-approved version.
+        tab.insert_ocr_text(final_text)
+        tab.saved = False
+        self.update_tab_title(tab)
+        tab.write_temp_snapshot()
+        self.save_state()
+
+        self.set_status(f"Text vložen{lang_info}.")
+
+    def _show_ocr_preview_dialog(self, initial_text, language_tag=""):
+        """
+        Show OCR result in an editable multiline preview.
+
+        Returns the edited text when confirmed, otherwise None.
+        """
+        result = {"value": None}
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Náhled rozpoznaného textu")
+        dialog.transient(self.root)
+        dialog.minsize(560, 380)
+        dialog.geometry("700x520")
+        dialog.configure(background=UI_BG)
+
+        if getattr(self, "_app_icon_photo", None) is not None:
+            try:
+                dialog.iconphoto(True, self._app_icon_photo)
+            except tk.TclError:
+                pass
+
+        # Grid is used deliberately here so the bottom action bar always keeps
+        # its own row. A vertically expanding Text widget must never be able to
+        # push the buttons outside the visible dialog.
+        outer = ttk.Frame(dialog, padding=(18, 16, 18, 16))
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            outer,
+            text="Rozpoznaný text",
+            font=("Segoe UI", 11, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+
+        subtitle = "Text můžete před vložením ručně upravit."
+        if language_tag:
+            subtitle += f"  OCR jazyk: {language_tag}"
+
+        ttk.Label(
+            outer,
+            text=subtitle,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 10))
+
+        editor_frame = ttk.Frame(outer)
+        editor_frame.grid(row=2, column=0, sticky="nsew")
+        editor_frame.columnconfigure(0, weight=1)
+        editor_frame.rowconfigure(0, weight=1)
+
+        preview_text = tk.Text(
+            editor_frame,
+            wrap="word",
+            undo=True,
+            font=("Segoe UI", 11),
+            background=EDITOR_BG,
+            foreground=TEXT_COLOR,
+            insertbackground=TEXT_COLOR,
+            relief="solid",
+            borderwidth=1,
+            height=10,
+        )
+        preview_text.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(
+            editor_frame,
+            orient="vertical",
+            command=preview_text.yview,
+        )
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        preview_text.configure(yscrollcommand=scrollbar.set)
+
+        preview_text.insert("1.0", initial_text)
+        preview_text.mark_set("insert", "1.0")
+        preview_text.see("1.0")
+
+        def confirm(event=None):
+            result["value"] = preview_text.get("1.0", "end-1c")
+            dialog.destroy()
+            return "break"
+
+        def cancel(event=None):
+            result["value"] = None
+            dialog.destroy()
+            return "break"
+
+        # Dedicated fixed bottom row. This row is never given expansion weight,
+        # therefore the controls remain visible at every supported window size.
+        action_bar = ttk.Frame(outer)
+        action_bar.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        action_bar.columnconfigure(0, weight=1)
+
+        shortcut_info = ttk.Label(
+            action_bar,
+            text="Esc = Zrušit   •   Ctrl+Enter = Vložit text",
+        )
+        shortcut_info.grid(row=0, column=0, sticky="w")
+
+        cancel_button = ttk.Button(
+            action_bar,
+            text="Zrušit",
+            command=cancel,
+            width=14,
+        )
+        cancel_button.grid(row=0, column=1, padx=(8, 0))
+
+        insert_button = ttk.Button(
+            action_bar,
+            text="Vložit text",
+            command=confirm,
+            width=16,
+        )
+        insert_button.grid(row=0, column=2, padx=(8, 0))
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.bind("<Escape>", cancel)
+        dialog.bind("<Control-Return>", confirm)
+
+        dialog.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (
+                self.root.winfo_width() - dialog.winfo_width()
+            ) // 2
+            y = self.root.winfo_rooty() + (
+                self.root.winfo_height() - dialog.winfo_height()
+            ) // 2
+            dialog.geometry(
+                f"{dialog.winfo_width()}x{dialog.winfo_height()}"
+                f"+{max(0, x)}+{max(0, y)}"
+            )
+        except tk.TclError:
+            pass
+
+        dialog.grab_set()
+        preview_text.focus_set()
+        self.root.wait_window(dialog)
+
+        return result["value"]
+
+
+    def _finish_ocr_error(self, error):
+        self.root.config(cursor="")
+        self.set_status("OCR se nezdařilo.")
+
+        if isinstance(error, OcrError):
+            detail = str(error)
+        else:
+            detail = f"{type(error).__name__}: {error}"
+
+        messagebox.showerror(
+            "Převod obrázku na text",
+            "Text se nepodařilo rozpoznat.\n\n"
+            f"{detail}",
+            parent=self.root,
+        )
 
     def paste_image_current_tab(self):
         tab = self.current_tab()
