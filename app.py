@@ -1,5 +1,6 @@
 import json
 import os
+import ctypes
 import re
 import sys
 import tempfile
@@ -10,7 +11,7 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from PIL import Image, ImageGrab, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageGrab, ImageTk, ImageWin
 from docx import Document
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
@@ -18,7 +19,10 @@ from docx.shared import Inches, Pt
 from updater import GitHubUpdater, UpdateError
 
 APP_NAME = "AutoSave Notepad"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.3"
+
+WINDOWS_APP_ID = "BignerCZE.SimpleNotePad"
+
 GITHUB_OWNER = "BignerCZE"
 GITHUB_REPO = "SimpleNotePad"
 
@@ -39,6 +43,47 @@ BUTTON_HOVER = "#eeeeee"
 FORMAT_ACTIVE_BG = "#dbeafe"
 FORMAT_ACTIVE_HOVER = "#cfe3fc"
 FORMAT_ACTIVE_BORDER = "#7aa7d9"
+
+
+
+def configure_windows_app_identity():
+    """Give Windows a stable identity for taskbar grouping."""
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            WINDOWS_APP_ID
+        )
+    except Exception:
+        pass
+
+
+def resource_path(filename):
+    """Resolve bundled resources in source and PyInstaller one-file builds."""
+    try:
+        base = Path(sys._MEIPASS)
+    except Exception:
+        base = Path(__file__).resolve().parent
+    return base / filename
+
+
+def apply_tk_window_icon(root):
+    """
+    Set the Tk application icon using iconphoto.
+
+    This is the icon source used by Tk itself for the window/taskbar icon.
+    Keep a Python reference to PhotoImage for the lifetime of the window.
+    """
+    icon_path = resource_path("icon.png")
+    if not icon_path.exists():
+        return None
+
+    try:
+        icon = tk.PhotoImage(file=str(icon_path))
+        root.iconphoto(True, icon)
+        return icon
+    except tk.TclError:
+        return None
 
 
 class NoteTab:
@@ -995,6 +1040,7 @@ class NoteTab:
 class AutoSaveNotepadApp:
     def __init__(self, root):
         self.root = root
+        self._app_icon_photo = apply_tk_window_icon(self.root)
         self.root.title(f"{APP_NAME} {APP_VERSION}")
         self.root.geometry("1050x700")
         self.root.minsize(760, 480)
@@ -1467,6 +1513,7 @@ class AutoSaveNotepadApp:
         if tab and tab.fit_selected_image_to_window():
             self.sync_image_menu_state()
 
+
     def current_tab(self):
         current = self.notebook.select()
         if not current:
@@ -1900,13 +1947,14 @@ class AutoSaveNotepadApp:
         )
 
     def _windows_print_dialog(self):
-        """Show the native Windows print dialog and return printer info."""
+        """Show the native Windows print dialog and return a configured printer DC."""
         if os.name != "nt":
             raise OSError("Tiskový dialog je v této verzi podporován pouze ve Windows.")
 
         import ctypes
         from ctypes import wintypes
 
+        PD_RETURNDC = 0x00000100
         PD_NOSELECTION = 0x00000004
         PD_NOPAGENUMS = 0x00000008
         PD_HIDEPRINTTOFILE = 0x00100000
@@ -1940,6 +1988,9 @@ class AutoSaveNotepadApp:
 
         comdlg32.PrintDlgW.argtypes = [ctypes.POINTER(PRINTDLGW)]
         comdlg32.PrintDlgW.restype = wintypes.BOOL
+        comdlg32.CommDlgExtendedError.argtypes = []
+        comdlg32.CommDlgExtendedError.restype = wintypes.DWORD
+
         kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
         kernel32.GlobalLock.restype = ctypes.c_void_p
         kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
@@ -1951,7 +2002,8 @@ class AutoSaveNotepadApp:
         dialog.lStructSize = ctypes.sizeof(PRINTDLGW)
         dialog.hwndOwner = self.root.winfo_id()
         dialog.Flags = (
-            PD_NOSELECTION
+            PD_RETURNDC
+            | PD_NOSELECTION
             | PD_NOPAGENUMS
             | PD_HIDEPRINTTOFILE
             | PD_USEDEVMODECOPIESANDCOLLATE
@@ -1959,32 +2011,22 @@ class AutoSaveNotepadApp:
         dialog.nCopies = 1
 
         if not comdlg32.PrintDlgW(ctypes.byref(dialog)):
-            # Cancel is not an error. CommDlgExtendedError returns zero on cancel.
             error_code = comdlg32.CommDlgExtendedError()
             if error_code:
                 raise OSError(f"Windows tiskový dialog selhal (0x{error_code:08X}).")
             return None
 
-        printer = None
-        driver = ""
-        output = ""
+        printer = "Vybraná tiskárna"
 
         try:
             if dialog.hDevNames:
                 ptr = kernel32.GlobalLock(dialog.hDevNames)
                 if ptr:
                     try:
-                        # DEVNAMES contains four WORD offsets. The offsets are
-                        # measured in UTF-16 characters from the structure start.
                         offsets = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_ushort))
-                        driver_offset = offsets[0]
                         device_offset = offsets[1]
-                        output_offset = offsets[2]
-
                         base = int(ptr)
-                        driver = ctypes.wstring_at(base + driver_offset * 2)
                         printer = ctypes.wstring_at(base + device_offset * 2)
-                        output = ctypes.wstring_at(base + output_offset * 2)
                     finally:
                         kernel32.GlobalUnlock(dialog.hDevNames)
         finally:
@@ -1993,78 +2035,379 @@ class AutoSaveNotepadApp:
             if dialog.hDevNames:
                 kernel32.GlobalFree(dialog.hDevNames)
 
-        if not printer:
-            raise OSError("Z tiskového dialogu se nepodařilo zjistit vybranou tiskárnu.")
+        if not dialog.hDC:
+            raise OSError("Windows nevrátil tiskový kontext zvolené tiskárny.")
 
         return {
             "printer": printer,
-            "driver": driver,
-            "output": output,
-            "copies": max(1, int(dialog.nCopies or 1)),
+            "hdc": int(dialog.hDC),
         }
 
-    def _create_print_snapshot(self, tab):
-        print_dir = Path(tempfile.gettempdir()) / "AutoSaveNotepad_print"
-        print_dir.mkdir(parents=True, exist_ok=True)
+    def _print_font_path(self, bold=False, italic=False):
+        """Return a Windows font file that matches the editor as closely as possible."""
+        windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
+        fonts = windir / "Fonts"
 
-        # Remove old print snapshots. Current jobs remain untouched because only
-        # files older than one day are removed.
+        if bold and italic:
+            candidates = ("segoeuiz.ttf", "arialbi.ttf")
+        elif bold:
+            candidates = ("segoeuib.ttf", "arialbd.ttf")
+        elif italic:
+            candidates = ("segoeuii.ttf", "ariali.ttf")
+        else:
+            candidates = ("segoeui.ttf", "arial.ttf")
+
+        for name in candidates:
+            path = fonts / name
+            if path.exists():
+                return str(path)
+
+        # Pillow can sometimes resolve the family name through FreeType.
+        return "arial.ttf"
+
+    def _print_font(self, style, dpi):
+        size_pt = int(style.get("size") or DEFAULT_FONT_SIZE)
+        size_px = max(8, int(round(size_pt * dpi / 72.0)))
+        path = self._print_font_path(
+            bold=bool(style.get("bold")),
+            italic=bool(style.get("italic")),
+        )
+        return ImageFont.truetype(path, size_px)
+
+    def _draw_print_text(
+        self,
+        draw,
+        text,
+        style,
+        x,
+        y,
+        content_left,
+        content_right,
+        content_bottom,
+        line_gap,
+        dpi,
+        new_page,
+    ):
+        """Draw wrapped styled text and return updated x/y/draw state."""
+        font = self._print_font(style, dpi)
+        underline = bool(style.get("underline"))
+
         try:
-            import time
-            cutoff = time.time() - 86400
-            for old_file in print_dir.glob("*.docx"):
-                try:
-                    if old_file.stat().st_mtime < cutoff:
-                        old_file.unlink()
-                except OSError:
-                    pass
-        except OSError:
-            pass
+            ascent, descent = font.getmetrics()
+            line_height = max(1, ascent + descent + line_gap)
+        except Exception:
+            bbox = draw.textbbox((0, 0), "Ag", font=font)
+            line_height = max(1, bbox[3] - bbox[1] + line_gap)
 
-        safe_title = self.sanitize_filename(tab.get_title()) or "Poznamka"
-        snapshot = print_dir / f"{safe_title}_{uuid.uuid4().hex}.docx"
-        tab.save_docx(snapshot)
-        return snapshot
+        def text_width(value):
+            if not value:
+                return 0
+            box = draw.textbbox((0, 0), value, font=font)
+            return max(0, box[2] - box[0])
 
-    def _send_docx_to_printer(self, path, printer_info):
-        if os.name != "nt":
-            raise OSError("Tisk je v této verzi podporován pouze ve Windows.")
+        def ensure_vertical_space(height):
+            nonlocal draw, x, y
+            if y + height > content_bottom:
+                draw, x, y = new_page()
+            return draw, x, y
 
-        import ctypes
+        # Preserve whitespace and explicit newlines, but wrap normal text.
+        chunks = re.findall(r"\n|[^\S\n]+|[^\s\n]+", text)
 
-        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-        shell32.ShellExecuteW.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_wchar_p,
-            ctypes.c_wchar_p,
-            ctypes.c_wchar_p,
-            ctypes.c_wchar_p,
-            ctypes.c_int,
-        ]
-        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        for chunk in chunks:
+            if chunk == "\n":
+                x = content_left
+                y += line_height
+                ensure_vertical_space(line_height)
+                continue
 
-        printer = printer_info["printer"]
-        driver = printer_info.get("driver", "")
-        output = printer_info.get("output", "")
-        copies = max(1, int(printer_info.get("copies", 1)))
+            if not chunk:
+                continue
 
-        parameters = f'"{printer}" "{driver}" "{output}"'
+            width = text_width(chunk)
 
-        for _ in range(copies):
-            result = shell32.ShellExecuteW(
-                None,
-                "printto",
-                str(path),
-                parameters,
-                str(path.parent),
-                0,
-            )
-            code = int(result or 0)
-            if code <= 32:
-                raise OSError(
-                    "Windows nedokázal předat DOCX tiskové aplikaci "
-                    f"(ShellExecute kód {code})."
+            # Skip leading spaces on a wrapped line.
+            if chunk.isspace() and x == content_left:
+                continue
+
+            if x > content_left and x + width > content_right:
+                x = content_left
+                y += line_height
+                ensure_vertical_space(line_height)
+                if chunk.isspace():
+                    continue
+
+            # Very long unbroken text: split by character to avoid clipping.
+            if width > (content_right - content_left):
+                remaining = chunk
+                while remaining:
+                    fit = ""
+                    for char in remaining:
+                        candidate = fit + char
+                        if fit and text_width(candidate) > (content_right - x):
+                            break
+                        fit = candidate
+
+                    if not fit:
+                        fit = remaining[0]
+
+                    draw.text((x, y), fit, font=font, fill="black")
+
+                    if underline:
+                        w = text_width(fit)
+                        underline_y = y + line_height - max(1, int(dpi / 96))
+                        draw.line(
+                            (x, underline_y, x + w, underline_y),
+                            fill="black",
+                            width=max(1, int(round(dpi / 192))),
+                        )
+
+                    remaining = remaining[len(fit):]
+                    x += text_width(fit)
+
+                    if remaining:
+                        x = content_left
+                        y += line_height
+                        ensure_vertical_space(line_height)
+                continue
+
+            draw.text((x, y), chunk, font=font, fill="black")
+
+            if underline:
+                underline_y = y + line_height - max(1, int(dpi / 96))
+                draw.line(
+                    (x, underline_y, x + width, underline_y),
+                    fill="black",
+                    width=max(1, int(round(dpi / 192))),
                 )
+
+            x += width
+
+        return draw, x, y, line_height
+
+    def _print_note_to_dc(self, tab, printer_info):
+        """Render the current editor directly to the selected Windows printer DC."""
+        import ctypes
+        from ctypes import wintypes
+
+        hdc = int(printer_info["hdc"])
+        printer_name = printer_info.get("printer", "Tiskárna")
+
+        gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+
+        gdi32.GetDeviceCaps.argtypes = [wintypes.HDC, ctypes.c_int]
+        gdi32.GetDeviceCaps.restype = ctypes.c_int
+        gdi32.StartDocW.argtypes = [wintypes.HDC, ctypes.c_void_p]
+        gdi32.StartDocW.restype = ctypes.c_int
+        gdi32.StartPage.argtypes = [wintypes.HDC]
+        gdi32.StartPage.restype = ctypes.c_int
+        gdi32.EndPage.argtypes = [wintypes.HDC]
+        gdi32.EndPage.restype = ctypes.c_int
+        gdi32.EndDoc.argtypes = [wintypes.HDC]
+        gdi32.EndDoc.restype = ctypes.c_int
+        gdi32.AbortDoc.argtypes = [wintypes.HDC]
+        gdi32.AbortDoc.restype = ctypes.c_int
+        gdi32.DeleteDC.argtypes = [wintypes.HDC]
+        gdi32.DeleteDC.restype = wintypes.BOOL
+
+        HORZRES = 8
+        VERTRES = 10
+        LOGPIXELSX = 88
+        LOGPIXELSY = 90
+
+        class DOCINFOW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_int),
+                ("lpszDocName", wintypes.LPCWSTR),
+                ("lpszOutput", wintypes.LPCWSTR),
+                ("lpszDatatype", wintypes.LPCWSTR),
+                ("fwType", wintypes.DWORD),
+            ]
+
+        printable_w = gdi32.GetDeviceCaps(hdc, HORZRES)
+        printable_h = gdi32.GetDeviceCaps(hdc, VERTRES)
+        device_dpi_x = max(72, gdi32.GetDeviceCaps(hdc, LOGPIXELSX))
+        device_dpi_y = max(72, gdi32.GetDeviceCaps(hdc, LOGPIXELSY))
+
+        if printable_w <= 0 or printable_h <= 0:
+            gdi32.DeleteDC(hdc)
+            raise OSError("Zvolená tiskárna nevrátila platnou tiskovou oblast.")
+
+        # Render at up to 300 DPI. This keeps text and screenshots sharp while
+        # preventing excessive memory use on 600/1200 DPI printer drivers.
+        render_dpi = min(300, max(150, device_dpi_y))
+        scale_x = printable_w / max(1, int(round(printable_w * render_dpi / device_dpi_x)))
+        scale_y = printable_h / max(1, int(round(printable_h * render_dpi / device_dpi_y)))
+
+        page_w = max(1, int(round(printable_w * render_dpi / device_dpi_x)))
+        page_h = max(1, int(round(printable_h * render_dpi / device_dpi_y)))
+
+        # 15 mm logical page margins inside the printable region.
+        margin = max(24, int(round(render_dpi * 15 / 25.4)))
+        content_left = margin
+        content_top = margin
+        content_right = max(content_left + 50, page_w - margin)
+        content_bottom = max(content_top + 50, page_h - margin)
+        line_gap = max(2, int(round(render_dpi * 0.035)))
+
+        pages = []
+        page = None
+        draw = None
+        x = content_left
+        y = content_top
+
+        def create_page():
+            nonlocal page, draw, x, y
+            page = Image.new("RGB", (page_w, page_h), "white")
+            draw = ImageDraw.Draw(page)
+            pages.append(page)
+            x = content_left
+            y = content_top
+            return draw, x, y
+
+        create_page()
+
+        dump = tab.text.dump(
+            "1.0",
+            "end-1c",
+            text=True,
+            tag=True,
+            image=True,
+        )
+
+        for kind, value, index in dump:
+            if kind == "text":
+                style = tab.style_at(index)
+
+                def new_page_for_text():
+                    return create_page()
+
+                draw, x, y, _line_height = self._draw_print_text(
+                    draw=draw,
+                    text=value,
+                    style=style,
+                    x=x,
+                    y=y,
+                    content_left=content_left,
+                    content_right=content_right,
+                    content_bottom=content_bottom,
+                    line_gap=line_gap,
+                    dpi=render_dpi,
+                    new_page=new_page_for_text,
+                )
+
+            elif kind == "image":
+                meta = tab.embedded_images.get(value)
+                if not meta or not meta.get("bytes"):
+                    continue
+
+                try:
+                    with Image.open(BytesIO(meta["bytes"])) as opened:
+                        image = opened.convert("RGB").copy()
+                except Exception:
+                    continue
+
+                original_w, original_h = image.size
+                display_width_px = int(
+                    meta.get("display_width_px") or original_w
+                )
+
+                # Editor pixels map to 96 DPI physical units, same convention
+                # used when saving the image size to DOCX.
+                target_w = max(
+                    1,
+                    int(round(display_width_px / 96.0 * render_dpi)),
+                )
+                max_w = content_right - content_left
+                target_w = min(target_w, max_w)
+                target_h = max(
+                    1,
+                    int(round(original_h * target_w / original_w)),
+                )
+
+                # Images are block-like for printing. Finish the current text
+                # line first if needed.
+                if x != content_left:
+                    base_style = {"size": DEFAULT_FONT_SIZE}
+                    font = self._print_font(base_style, render_dpi)
+                    try:
+                        ascent, descent = font.getmetrics()
+                        normal_line_h = ascent + descent + line_gap
+                    except Exception:
+                        normal_line_h = int(round(DEFAULT_FONT_SIZE * render_dpi / 72)) + line_gap
+                    x = content_left
+                    y += normal_line_h
+
+                # If the image itself is taller than a printable page, shrink
+                # it to fit one page while preserving aspect ratio.
+                max_h = content_bottom - content_top
+                if target_h > max_h:
+                    ratio = max_h / target_h
+                    target_w = max(1, int(round(target_w * ratio)))
+                    target_h = max(1, int(round(target_h * ratio)))
+
+                if y + target_h > content_bottom:
+                    create_page()
+
+                if image.size != (target_w, target_h):
+                    image = image.resize(
+                        (target_w, target_h),
+                        Image.Resampling.LANCZOS,
+                    )
+
+                page.paste(image, (content_left, y))
+                y += target_h + max(6, int(round(render_dpi * 0.06)))
+                x = content_left
+
+        docinfo = DOCINFOW()
+        docinfo.cbSize = ctypes.sizeof(DOCINFOW)
+        docinfo.lpszDocName = tab.get_title() or APP_NAME
+        docinfo.lpszOutput = None
+        docinfo.lpszDatatype = None
+        docinfo.fwType = 0
+
+        started_doc = False
+
+        try:
+            if gdi32.StartDocW(hdc, ctypes.byref(docinfo)) <= 0:
+                raise OSError(
+                    f"Windows nedokázal zahájit tiskovou úlohu pro {printer_name}."
+                )
+            started_doc = True
+
+            for page_image in pages:
+                if gdi32.StartPage(hdc) <= 0:
+                    raise OSError("Windows nedokázal zahájit tisk stránky.")
+
+                try:
+                    dib = ImageWin.Dib(page_image)
+                    dib.draw(
+                        hdc,
+                        (
+                            0,
+                            0,
+                            printable_w,
+                            printable_h,
+                        ),
+                    )
+                finally:
+                    if gdi32.EndPage(hdc) <= 0:
+                        raise OSError("Windows nedokázal dokončit tisk stránky.")
+
+            if gdi32.EndDoc(hdc) <= 0:
+                raise OSError("Windows nedokázal dokončit tiskovou úlohu.")
+
+            started_doc = False
+
+        except Exception:
+            if started_doc:
+                try:
+                    gdi32.AbortDoc(hdc)
+                except Exception:
+                    pass
+            raise
+        finally:
+            gdi32.DeleteDC(hdc)
 
     def print_current_document(self, event=None):
         tab = self.current_tab()
@@ -2079,23 +2422,41 @@ class AutoSaveNotepadApp:
             )
             return "break" if event is not None else None
 
+        printer_info = None
+
         try:
             printer_info = self._windows_print_dialog()
             if printer_info is None:
                 return "break" if event is not None else None
 
-            snapshot = self._create_print_snapshot(tab)
-            self._send_docx_to_printer(snapshot, printer_info)
             self.set_status(
-                f"Dokument byl předán k tisku: {printer_info['printer']}"
+                f"Připravuji tisk: {printer_info['printer']}"
             )
+            self.root.update_idletasks()
+
+            self._print_note_to_dc(tab, printer_info)
+            printer_info = None  # DC was released by _print_note_to_dc.
+
+            self.set_status("Dokument byl odeslán do tiskové fronty.")
+
         except Exception as e:
+            # If rendering failed before _print_note_to_dc took ownership of
+            # the DC, release it here.
+            if printer_info and printer_info.get("hdc"):
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+                    gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+                    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+                    gdi32.DeleteDC.restype = wintypes.BOOL
+                    gdi32.DeleteDC(int(printer_info["hdc"]))
+                except Exception:
+                    pass
+
             messagebox.showerror(
                 "Tisk",
                 "Dokument se nepodařilo vytisknout.\n\n"
-                f"{e}\n\n"
-                "Pro tisk DOCX musí být ve Windows nainstalována aplikace, "
-                "která podporuje systémovou akci Tisk (typicky Microsoft Word).",
+                f"{e}",
                 parent=self.root,
             )
 
@@ -2431,6 +2792,7 @@ class AutoSaveNotepadApp:
 
 
 def main():
+    configure_windows_app_identity()
     root = tk.Tk()
     AutoSaveNotepadApp(root)
     root.mainloop()
